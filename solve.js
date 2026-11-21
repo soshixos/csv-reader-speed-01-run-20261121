@@ -18,9 +18,11 @@
 // at a time. This reader jumps instead: an unquoted field is cut with two indexOf jumps (comma,
 // line feed) and one slice, and a CR in it is found through one list of every CR in the text,
 // walked once up front, instead of a search per field that would walk past the field's end
-// whenever the next CR sits far away. A quoted field jumps the same way between its quotes and
-// line breaks, with each CR inside it found only inside the span up to the next quote or break.
-// Nothing is kept from one call to the next, and each case is answered alone.
+// whenever the next CR sits far away. The line feed is found once per record and reused for
+// every field of it, instead of re-scanning the rest of the record per field. A quoted field
+// jumps the same way between its quotes and line breaks, with each CR inside it found only
+// through the CR list, never by slicing the span. Nothing is kept from one call to the next,
+// and each case is answered alone.
 
 /** How a field ended: at a comma, at a line break, or at the end of the text. */
 const COMMA = 0;
@@ -166,8 +168,10 @@ export function run(input) {
         kind = 1;
       }
       // A CR before that quote or line break, if any: inside quotes it reads as LF.
+      // Found through the CR list, never by slicing and searching the span.
       const bound = idx === -1 ? n : idx;
-      const crAt = text.slice(scan, bound).indexOf('\r');
+      while (crPtr < crLen && crList[crPtr] < scan) crPtr++;
+      const crAt = crPtr < crLen && crList[crPtr] < bound ? crList[crPtr] - scan : -1;
       if (crAt !== -1) {
         if (parts === null) parts = [];
         parts.push(text.slice(scan, scan + crAt));
@@ -181,6 +185,17 @@ export function run(input) {
         // again as an unquoted field.
         pos = open + 1;
         line = openLine;
+        // pos moves back, so the CR pointer must too: the first CR at or after it (binary
+        // search; the list is sorted). readUnquoted does not use the pointer, and the record
+        // loop's own advance only ever moves it forward.
+        let lo = 0;
+        let hi = crLen;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (crList[mid] < open + 1) lo = mid + 1;
+          else hi = mid;
+        }
+        crPtr = lo;
         pushError('unterminated_quote');
         const again = readUnquoted(open + 1, '"');
         qEnded = again.ended;
@@ -251,6 +266,12 @@ export function run(input) {
 
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
+    // The record's first LF, found once: an unquoted field ends at the first comma or LF
+    // after it, and the LF is the same for every field of the record unless a quoted field
+    // swallows it (then it is stale, below its position, and found again once). A quoted
+    // field later in the record is always past a comma, so the memo can only ever be the
+    // nearer bound for the field being read, never a wrong one.
+    let recLf = text.indexOf('\n', pos);
     const fields = [];
     let ended;
     let lastQuoted = false;
@@ -265,7 +286,8 @@ export function run(input) {
         // only through the CR pointer, never by searching past the field's end.
         while (crPtr < crLen && crList[crPtr] < pos) crPtr++;
         const iComma = text.indexOf(',', pos);
-        const iLf = text.indexOf('\n', pos);
+        let iLf = recLf;
+        if (iLf !== -1 && iLf < pos) iLf = recLf = text.indexOf('\n', pos);
         let idx = -1;
         let kind = COMMA;
         if (iComma !== -1) {
